@@ -1,0 +1,126 @@
+name: TurboFetch PRO - Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      large_test:
+        description: Run both optional 5 GiB pause/resume tests (requires 11 GiB free disk)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare project (ZIP or extracted repository)
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f settings.gradle && -f TurboFetch-PRO-v1.0.0-alpha.3-source.zip ]]; then
+            echo "Both extracted project and alpha.3 ZIP present; choose only one." >&2
+            exit 1
+          elif [[ -f settings.gradle ]]; then
+            dir="$GITHUB_WORKSPACE"
+          elif [[ -f TurboFetch-PRO-v1.0.0-alpha.3-source.zip ]]; then
+            dir="$RUNNER_TEMP/turbofetch-source"
+            mkdir -p "$dir"
+            python3 - "$dir" <<'PYCODE'
+          import sys, zipfile, pathlib, stat
+          root=pathlib.Path(sys.argv[1]).resolve()
+          with zipfile.ZipFile('TurboFetch-PRO-v1.0.0-alpha.3-source.zip') as z:
+              for entry in z.infolist():
+                  target=(root/entry.filename).resolve()
+                  if not target.is_relative_to(root) or stat.S_ISLNK(entry.external_attr >> 16):
+                      raise RuntimeError('Unsafe archive entry: '+entry.filename)
+              z.extractall(root)
+          PYCODE
+          else
+            echo 'Upload TurboFetch-PRO-v1.0.0-alpha.3-source.zip or the extracted project.' >&2
+            exit 1
+          fi
+          test -f "$dir/settings.gradle"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Run HTTP engine integration tests
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: set -o pipefail; bash tools/test-core.sh | tee core-test-output.txt
+      - name: Optional 5 GiB test
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.large_test }}
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: set -euo pipefail; bash tools/test-extra.sh large | tee large-test-output.txt; bash tools/test-extra.sh large-direct | tee large-direct-test-output.txt
+      - name: Configure optional owner signing key
+        working-directory: ${{ steps.source.outputs.dir }}
+        env:
+          KEYSTORE_B64: ${{ secrets.TURBO_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.TURBO_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.TURBO_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.TURBO_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$KEYSTORE_B64" ]]; then
+            if [[ -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+              echo "All four owner signing secrets are required." >&2
+              exit 1
+            fi
+            umask 077
+            printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/turbo-owner.jks"
+            echo "TURBO_KEYSTORE=$RUNNER_TEMP/turbo-owner.jks" >> "$GITHUB_ENV"
+          fi
+      - name: Build installable debug APK
+        working-directory: ${{ steps.source.outputs.dir }}
+        env:
+          TURBO_STORE_PASSWORD: ${{ secrets.TURBO_STORE_PASSWORD }}
+          TURBO_KEY_ALIAS: ${{ secrets.TURBO_KEY_ALIAS }}
+          TURBO_KEY_PASSWORD: ${{ secrets.TURBO_KEY_PASSWORD }}
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+      - name: Generate APK checksum
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: sha256sum app/build/outputs/apk/debug/app-debug.apk > app/build/outputs/apk/debug/app-debug.apk.sha256
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurboFetch-PRO-v1.0.0-alpha.3-APK
+          path: |
+            ${{ steps.source.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+            ${{ steps.source.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk.sha256
+          if-no-files-found: error
+      - name: Android lint
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: gradle --no-daemon --stacktrace :app:lintDebug
+      - name: Upload test reports
+        if: always() && steps.source.outputs.dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-reports
+          path: |
+            ${{ steps.source.outputs.dir }}/core-test-output.txt
+            ${{ steps.source.outputs.dir }}/large-test-output.txt
+            ${{ steps.source.outputs.dir }}/large-direct-test-output.txt
+          if-no-files-found: ignore
+      - name: Upload lint report
+        if: always() && steps.source.outputs.dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lint-report
+          path: ${{ steps.source.outputs.dir }}/app/build/reports/lint-results-debug.*
+          if-no-files-found: ignore
