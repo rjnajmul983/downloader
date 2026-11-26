@@ -1,129 +1,170 @@
-name: TurboFetch PRO - Build APK
-
+name: TurboFetch PRO - Restoration Ultimate
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
     inputs:
       large_test:
-        description: Run both optional 5 GiB pause/resume tests (requires 11 GiB free disk)
+        description: Run optional 5 GiB direct and legacy core tests
         type: boolean
         default: false
-
+      device_smoke:
+        description: Run emulator installation and launcher smoke test
+        type: boolean
+        default: true
+      device_api:
+        description: Android emulator API level (35 = Android 15; 36 = Android 16)
+        type: choice
+        options: ['35', '36']
+        default: '35'
+      device_browser:
+        description: Run additional original browser scanner UI test (experimental)
+        type: boolean
+        default: false
+      recover_java:
+        description: Recover Java source with JADX (best effort)
+        type: boolean
+        default: true
+  push:
+    branches: [main, master]
 permissions:
   contents: read
-
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+  restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare project (ZIP or extracted repository)
+      - name: Extract source and restore original APK
         id: source
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f settings.gradle && -f TurboFetch-PRO-v1.0.0-alpha.3-source.zip ]]; then
-            echo "Both extracted project and alpha.3 ZIP present; choose only one." >&2
-            exit 1
-          elif [[ -f settings.gradle ]]; then
-            dir="$GITHUB_WORKSPACE"
-          elif [[ -f TurboFetch-PRO-v1.0.0-alpha.3-source.zip ]]; then
-            dir="$RUNNER_TEMP/turbofetch-source"
-            mkdir -p "$dir"
-            python3 - "$dir" <<'PYCODE'
-          import sys, zipfile, pathlib, stat
-          root=pathlib.Path(sys.argv[1]).resolve()
-          with zipfile.ZipFile('TurboFetch-PRO-v1.0.0-alpha.3-source.zip') as z:
-              for entry in z.infolist():
-                  target=(root/entry.filename).resolve()
-                  if not target.is_relative_to(root) or stat.S_ISLNK(entry.external_attr >> 16):
-                      raise RuntimeError('Unsafe archive entry: '+entry.filename)
+          project="$RUNNER_TEMP/turbo-restoration"
+          mkdir -p "$project"
+          python3 - "$project" <<'PY'
+          import zipfile,pathlib,sys,stat,shutil
+          repo=pathlib.Path.cwd(); root=pathlib.Path(sys.argv[1]).resolve()
+          archive=repo/'TurboFetch-PRO-v1.0.0-restoration-ultimate-source.zip'
+          with zipfile.ZipFile(archive) as z:
+              for i in z.infolist():
+                  if not (root/i.filename).resolve().is_relative_to(root) or stat.S_ISLNK(i.external_attr>>16):
+                      raise RuntimeError('Unsafe archive path '+i.filename)
               z.extractall(root)
-          PYCODE
-          else
-            echo 'Upload TurboFetch-PRO-v1.0.0-alpha.3-source.zip or the extracted project.' >&2
-            exit 1
-          fi
-          test -f "$dir/settings.gradle"
-          echo "dir=$dir" >> "$GITHUB_OUTPUT"
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+          orig=root/'original/TurboFetch-Download-Manager-v0.4.0.apk'
+          if not orig.is_file():
+              whole=repo/orig.name
+              if whole.is_file(): shutil.copyfile(whole,orig)
+              else:
+                  p1=orig.with_name(orig.name+'.part01'); p2=repo/'TurboFetch-original.part02'
+                  if not p1.is_file() or not p2.is_file(): raise RuntimeError('Upload TurboFetch-original.part02 alongside source ZIP')
+                  with orig.open('wb') as out:
+                      for p in (p1,p2):
+                          with p.open('rb') as f: shutil.copyfileobj(f,out)
+          PY
+          cd "$project"
+          sha256sum -c original/SHA256SUMS
+          echo "dir=$project" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
-          log-accepted-android-sdk-licenses: 'false'
-      - name: Install Android SDK 35
-        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Set up Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
-      - name: Run HTTP engine integration tests
+      - name: Prepare Android SDK using hosted runner tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK"
+          if [[ ! -x "$SDK/build-tools/35.0.0/d8" || ! -f "$SDK/platforms/android-35/android.jar" ]]; then
+            manager=$(command -v sdkmanager || true)
+            if [[ -z "$manager" ]]; then manager=$(find "$SDK/cmdline-tools" -type f -name sdkmanager | head -n 1); fi
+            test -x "$manager"
+            "$manager" --install 'platforms;android-35' 'build-tools;35.0.0'
+          fi
+          test -x "$SDK/build-tools/35.0.0/apksigner"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+      - name: Download pinned APKTool
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar -o "$RUNNER_TEMP/apktool.jar"
+          java -jar "$RUNNER_TEMP/apktool.jar" --version
+          echo "APKTOOL_JAR=$RUNNER_TEMP/apktool.jar" >> "$GITHUB_ENV"
+      - name: Run regression tests and bridge tests
         working-directory: ${{ steps.source.outputs.dir }}
-        run: set -o pipefail; bash tools/test-core.sh | tee core-test-output.txt
-      - name: Optional 5 GiB test
+        run: |
+          set -euo pipefail
+          mkdir -p build/logs
+          bash tools/test-core.sh | tee build/logs/core-tests.txt
+          bash tools/test-bridge.sh | tee build/logs/bridge-tests.txt
+          python3 tools/test-patch.py | tee build/logs/patch-fixture.txt
+      - name: Controlled speed benchmark
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: |
+          set -euo pipefail
+          bash tools/test-extra.sh hyper | tee build/logs/speed-benchmark.txt
+      - name: Optional large file regression tests
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.large_test }}
         working-directory: ${{ steps.source.outputs.dir }}
-        run: set -euo pipefail; bash tools/test-extra.sh large | tee large-test-output.txt; bash tools/test-extra.sh large-direct | tee large-direct-test-output.txt
-      - name: Configure optional owner signing key
+        run: |
+          set -euo pipefail
+          bash tools/test-extra.sh large | tee build/logs/large.txt
+          bash tools/test-extra.sh large-direct | tee build/logs/large-direct.txt
+      - name: Restore original features and inject HyperSpeed engine
         working-directory: ${{ steps.source.outputs.dir }}
         env:
           KEYSTORE_B64: ${{ secrets.TURBO_KEYSTORE_B64 }}
           STORE_PASSWORD: ${{ secrets.TURBO_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.TURBO_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.TURBO_KEY_PASSWORD }}
+        run: bash tools/build-restoration.sh
+      - name: Upload installable APK and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurboFetch-PRO-Restoration-APK
+          path: ${{ steps.source.outputs.dir }}/build/output/
+          if-no-files-found: error
+      - name: Enable KVM access for emulator
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.device_smoke }}
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Android device smoke test
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.device_smoke }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.device_api }}
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash '${{ steps.source.outputs.dir }}/tools/device-smoke.sh' && if [[ '${{ inputs.device_browser }}' == 'true' ]]; then bash '${{ steps.source.outputs.dir }}/tools/device-browser.sh'; fi
+      - name: Recover readable Java source with JADX
+        if: ${{ always() && steps.source.outputs.dir != '' && (github.event_name != 'workflow_dispatch' || inputs.recover_java) }}
+        working-directory: ${{ steps.source.outputs.dir }}
+        shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "$KEYSTORE_B64" ]]; then
-            if [[ -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
-              echo "All four owner signing secrets are required." >&2
-              exit 1
-            fi
-            umask 077
-            printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/turbo-owner.jks"
-            echo "TURBO_KEYSTORE=$RUNNER_TEMP/turbo-owner.jks" >> "$GITHUB_ENV"
-          fi
-      - name: Build installable debug APK
-        working-directory: ${{ steps.source.outputs.dir }}
-        env:
-          TURBO_STORE_PASSWORD: ${{ secrets.TURBO_STORE_PASSWORD }}
-          TURBO_KEY_ALIAS: ${{ secrets.TURBO_KEY_ALIAS }}
-          TURBO_KEY_PASSWORD: ${{ secrets.TURBO_KEY_PASSWORD }}
-        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
-      - name: Generate APK checksum
-        working-directory: ${{ steps.source.outputs.dir }}
-        run: sha256sum app/build/outputs/apk/debug/app-debug.apk > app/build/outputs/apk/debug/app-debug.apk.sha256
-      - name: Upload APK
+          mkdir -p build/logs build/recovered-java
+          curl -fL --retry 3 https://github.com/skylot/jadx/releases/download/v1.5.2/jadx-1.5.2.zip -o "$RUNNER_TEMP/jadx.zip"
+          unzip -q "$RUNNER_TEMP/jadx.zip" -d "$RUNNER_TEMP/jadx"
+          chmod +x "$RUNNER_TEMP/jadx/bin/jadx"
+          set +e
+          "$RUNNER_TEMP/jadx/bin/jadx" --show-bad-code -d build/recovered-java original/TurboFetch-Download-Manager-v0.4.0.apk 2>&1 | tee build/logs/jadx.txt
+          result=${PIPESTATUS[0]}
+          echo "JADX exit status: $result (decompilation may be incomplete)" | tee -a build/logs/jadx.txt
+          exit 0
+      - name: Upload recovered original source and disassembly
+        if: ${{ always() && steps.source.outputs.dir != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: TurboFetch-PRO-v1.0.0-alpha.3-APK
+          name: TurboFetch-recovered-original-source
           path: |
-            ${{ steps.source.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
-            ${{ steps.source.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk.sha256
-          if-no-files-found: error
-      - name: Android lint
-        working-directory: ${{ steps.source.outputs.dir }}
-        run: gradle --no-daemon --stacktrace :app:lintDebug
-      - name: Upload test reports
-        if: always() && steps.source.outputs.dir != ''
+            ${{ steps.source.outputs.dir }}/build/recovered-java/
+            ${{ steps.source.outputs.dir }}/build/recovered-smali/
+          if-no-files-found: warn
+      - name: Upload build and regression logs
+        if: ${{ always() && steps.source.outputs.dir != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: core-test-reports
-          path: |
-            ${{ steps.source.outputs.dir }}/core-test-output.txt
-            ${{ steps.source.outputs.dir }}/large-test-output.txt
-            ${{ steps.source.outputs.dir }}/large-direct-test-output.txt
-          if-no-files-found: ignore
-      - name: Upload lint report
-        if: always() && steps.source.outputs.dir != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-lint-report
-          path: ${{ steps.source.outputs.dir }}/app/build/reports/lint-results-debug.*
-          if-no-files-found: ignore
+          name: TurboFetch-restoration-test-logs
+          path: ${{ steps.source.outputs.dir }}/build/logs/
+          if-no-files-found: warn
